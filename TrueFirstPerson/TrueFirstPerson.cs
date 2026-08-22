@@ -1,4 +1,4 @@
-﻿using BepInEx;
+using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using Multiplayer;
@@ -21,6 +21,8 @@ namespace DouBai.PerspectiveSwitcher
     }
 
     [BepInPlugin(PluginInfo.PLUGIN_GUID, PluginInfo.PLUGIN_NAME, PluginInfo.PLUGIN_VERSION)]
+    [BepInDependency("HSRTimer", BepInEx.BepInDependency.DependencyFlags.SoftDependency)]
+    [BepInDependency("TwilightTimer", BepInEx.BepInDependency.DependencyFlags.SoftDependency)]
     public class Plugin : BaseUnityPlugin
     {
         internal static new ManualLogSource Logger;
@@ -36,7 +38,7 @@ namespace DouBai.PerspectiveSwitcher
             var uiGo = new GameObject("PerspectiveSwitcher.UI");
             UnityEngine.Object.DontDestroyOnLoad(uiGo);
             uiGo.AddComponent<SettingsUi>();
-            HsrTimerIntegration.TryInit();
+            TimerIntegration.TryInit();
         }
     }
 
@@ -140,6 +142,8 @@ namespace DouBai.PerspectiveSwitcher
     [DefaultExecutionOrder(1000)]
     public class PerspectiveController : MonoBehaviour
     {
+        public static PerspectiveController Instance { get; private set; }
+
         private bool _firstPerson;
         private bool _headHidden;
         private float _blend;
@@ -149,6 +153,7 @@ namespace DouBai.PerspectiveSwitcher
         private int _crosshairTexSize;
         private const float TransitionDuration = 0.2f;
         private const float FirstPersonNearClip = 0.02f;
+        private const float TimerFpsRuleTimeout = 2f;
         private static int CrosshairRadius = 2;
         private static float CrosshairOpacity = 0.8f;
         private static Type _freeRoamType;
@@ -157,11 +162,83 @@ namespace DouBai.PerspectiveSwitcher
         private bool _freeRoamActive;
         private static Type _mapSwitcherType;
         private bool _mapHasOwnSwitcher;
+
+        // Timer "FPS" tag-rule state. While the rule is enabled and ticking, the
+        // plugin stays in first person and the toggle key is ignored. The lock
+        // releases when the timer stops ticking (tag disabled), the level ends,
+        // or the game leaves the level.
+        private bool _fpsRuleLocked;
+        private bool _firstPersonBeforeLock;
+        private bool _timerFpsRuleActive;
+        private float _lastTimerFpsRuleTick = float.MinValue;
+
         public bool IsFirstPerson => _firstPerson;
+
+        private void Awake()
+        {
+            Instance = this;
+        }
+
+        private void OnDestroy()
+        {
+            if (Instance == this)
+                Instance = null;
+        }
 
         public void TogglePerspective()
         {
+            if (_fpsRuleLocked) return;
             _firstPerson = !_firstPerson;
+        }
+
+        /// <summary>Called by the timer tag rule (via FpsRuleBridge) on level enter/tick/exit.</summary>
+        public static void SetFpsRuleActive(bool active)
+        {
+            if (Instance == null) return;
+            Instance._timerFpsRuleActive = active;
+            if (active)
+            {
+                Instance._lastTimerFpsRuleTick = Time.unscaledTime;
+                Instance.SetFirstPersonLocked(true);
+            }
+            else
+            {
+                Instance.SetFirstPersonLocked(false);
+            }
+        }
+
+        private void SetFirstPersonLocked(bool locked)
+        {
+            if (_fpsRuleLocked == locked) return;
+            _fpsRuleLocked = locked;
+            if (locked)
+            {
+                _firstPersonBeforeLock = _firstPerson;
+                _firstPerson = true;
+            }
+            else
+            {
+                _firstPerson = _firstPersonBeforeLock;
+            }
+        }
+
+        private void UpdateTimerFpsRule()
+        {
+            if (!_timerFpsRuleActive) return;
+            if (!ShouldKeepTimerFpsLock())
+                SetFpsRuleActive(false);
+        }
+
+        private bool ShouldKeepTimerFpsLock()
+        {
+            Game game = Game.instance;
+            if (game == null) return false;
+            GameState state = game.state;
+            if (state == GameState.PlayingLevel)
+                return Time.unscaledTime - _lastTimerFpsRuleTick <= TimerFpsRuleTimeout;
+            if (state == GameState.Paused)
+                return true;
+            return false;
         }
 
         private void OnEnable()
@@ -227,8 +304,11 @@ namespace DouBai.PerspectiveSwitcher
 
         private void Update()
         {
+            UpdateTimerFpsRule();
+
             if (_mapHasOwnSwitcher) return;
             if (UiShared.IsRebinding) return;
+            if (_fpsRuleLocked) return;
             if (Game.GetKeyDown(PerspectiveSettings.ToggleKey))
                 TogglePerspective();
         }
@@ -611,7 +691,7 @@ namespace DouBai.PerspectiveSwitcher
             GUILayout.Label(L10n.T("PS_TOGGLE_KEY"), Label);
             GUILayout.FlexibleSpace();
             string btn = _rebinding ? L10n.T("PS_PRESS_KEY") : PerspectiveSettings.ToggleKey.ToString();
-            bool clicked = HsrTimerIntegration.Enabled
+            bool clicked = TimerIntegration.Enabled
                 ? GUILayout.Button(btn, Button, GUILayout.Width(120))
                 : GUILayout.Button(btn, Button, GUILayout.Width(120), GUILayout.Height(25));
             if (clicked && Event.current.isMouse)
@@ -636,7 +716,7 @@ namespace DouBai.PerspectiveSwitcher
 
         private void Update()
         {
-            if (HsrTimerIntegration.Enabled) return;
+            if (TimerIntegration.Enabled) return;
             if (Game.GetKeyDown(PerspectiveSettings.UiToggleKey))
             {
                 _visible = !_visible;
@@ -648,7 +728,7 @@ namespace DouBai.PerspectiveSwitcher
         private void PositionRect()
         {
             const float w = 300f, h = 580f;
-            if (HsrTimerIntegration.Enabled)
+            if (TimerIntegration.Enabled)
                 _rect = new Rect(Screen.width * 0.5f - w * 0.5f, Screen.height * 0.5f - h * 0.5f, w, h);
             else
                 _rect = new Rect(Screen.width - w - 20f, Screen.height - h - 20f, w, h);
@@ -666,10 +746,10 @@ namespace DouBai.PerspectiveSwitcher
 
         private void OnGUI()
         {
-            if (HsrTimerIntegration.Enabled) return;
+            if (TimerIntegration.Enabled) return;
             if (!_visible) return;
             UiShared.EnsureStyles();
-            string title = HsrTimerIntegration.Enabled ? L10n.T("PS_TITLE") :
+            string title = TimerIntegration.Enabled ? L10n.T("PS_TITLE") :
                 L10n.T("PS_TITLE") + " v" + PluginInfo.PLUGIN_VERSION;
             _rect = GUI.Window(GetInstanceID(), _rect, Draw, title);
             _rect.width = 300f;
@@ -704,49 +784,190 @@ namespace DouBai.PerspectiveSwitcher
         }
     }
 
-    public static class HsrTimerIntegration
+    public static class FpsRuleBridge
     {
-        public static bool Enabled { get; private set; }
-        private static Type _panelType;
+        public const string Id = "FPS";
+        public const string DisplayNameKey = "";
+
+        public static void OnLevelEnter(object ctx)
+        {
+            PerspectiveController.SetFpsRuleActive(true);
+        }
+
+        public static void OnTick(object ctx)
+        {
+            PerspectiveController.SetFpsRuleActive(true);
+        }
+
+        public static void OnLevelExit(object ctx)
+        {
+            PerspectiveController.SetFpsRuleActive(false);
+        }
+    }
+
+    public static class TimerIntegration
+    {
+        private const string HSRTimerAssembly = "HSRTimer";
+        private const string TwilightTimerAssembly = "TwilightTimer";
+        private const string FpsTagId = "FPS";
+
         private static FieldInfo _tabDisplaysField;
         private static FieldInfo _tabField;
         private static int _baseTabCount = 3;
 
+        public static bool Enabled { get; private set; }
+
         public static void TryInit()
+        {
+            RegisterFpsRuleWithAnyTimer();
+            TryPatchSettingsPanel();
+        }
+
+        // ── FPS tag rule (HSRTimer / TwilightTimer, reflection-based) ───────
+
+        private static void RegisterFpsRuleWithAnyTimer()
+        {
+            TryRegisterFpsRule(HSRTimerAssembly);
+            TryRegisterFpsRule(TwilightTimerAssembly);
+        }
+
+        private static void TryRegisterFpsRule(string assemblyName)
         {
             try
             {
-                _panelType = Type.GetType("HSRTimer.SettingsPanel, HSRTimer");
-                if (_panelType == null) return;
-                var refresh = _panelType.GetMethod("RefreshTabDisplays", BindingFlags.Instance | BindingFlags.NonPublic);
-                var draw = _panelType.GetMethod("Draw", BindingFlags.Instance | BindingFlags.NonPublic);
-                _tabDisplaysField = _panelType.GetField("_tabDisplays", BindingFlags.Instance | BindingFlags.NonPublic);
-                _tabField = _panelType.GetField("_tab", BindingFlags.Instance | BindingFlags.NonPublic);
-                if (refresh == null || draw == null || _tabDisplaysField == null || _tabField == null)
-                    return;
-                var keysField = _panelType.GetField("_tabKeys", BindingFlags.Static | BindingFlags.NonPublic);
-                var keys = keysField != null ? keysField.GetValue(null) as string[] : null;
-                if (keys != null && keys.Length > 0) _baseTabCount = keys.Length;
-                var harmony = new HarmonyLib.Harmony(PluginInfo.PLUGIN_GUID + ".hsrtimer");
-                harmony.Patch(refresh,
-                    postfix: new HarmonyLib.HarmonyMethod(typeof(HsrTimerIntegration).GetMethod(
-                        "RefreshPostfix", BindingFlags.Static | BindingFlags.NonPublic)));
-                harmony.Patch(draw,
-                    transpiler: new HarmonyLib.HarmonyMethod(typeof(HsrTimerIntegration).GetMethod(
-                        "DrawTranspiler", BindingFlags.Static | BindingFlags.NonPublic)));
-                Enabled = true;
-                Plugin.Logger.LogInfo("PerspectiveSwitcher: HSRTimer settings panel integration enabled (last sub-tab).");
+                Type ruleType = Type.GetType(assemblyName + ".ITagRule, " + assemblyName);
+                Type registryType = Type.GetType(assemblyName + ".TagRuleRegistry, " + assemblyName);
+                if (ruleType == null || registryType == null) return;
+
+                var instanceProp = registryType.GetProperty("Instance", BindingFlags.Public | BindingFlags.Static);
+                if (instanceProp == null) return;
+                object registry = instanceProp.GetValue(null, null);
+                if (registry == null) return;
+
+                var register = registryType.GetMethod("Register", new[] { ruleType });
+                if (register == null) return;
+
+                Type proxyType = BuildFpsRuleProxy(ruleType);
+                object proxy = Activator.CreateInstance(proxyType);
+                object result = register.Invoke(registry, new[] { proxy });
+                if (result is bool ok && ok)
+                    Plugin.Logger.LogInfo($"PerspectiveSwitcher: registered '{FpsTagId}' tag rule with {assemblyName}.");
+                else
+                    Plugin.Logger.LogWarning($"PerspectiveSwitcher: {assemblyName} rejected '{FpsTagId}' tag rule (duplicate id?).");
             }
             catch (System.Exception ex)
             {
-                Enabled = false;
-                Plugin.Logger.LogWarning($"PerspectiveSwitcher: HSRTimer integration failed: {ex.Message}");
+                Plugin.Logger.LogWarning($"PerspectiveSwitcher: failed to register '{FpsTagId}' tag rule with {assemblyName}: {ex.Message}");
+            }
+        }
+
+        private static Type BuildFpsRuleProxy(Type interfaceType)
+        {
+            var asmName = new AssemblyName("PerspectiveSwitcher.FpsRuleProxy." + interfaceType.Assembly.GetName().Name);
+            AssemblyBuilder ab = AppDomain.CurrentDomain.DefineDynamicAssembly(asmName, AssemblyBuilderAccess.Run);
+            ModuleBuilder mb = ab.DefineDynamicModule("ProxyModule");
+            TypeBuilder tb = mb.DefineType("FpsTagRuleProxy",
+                TypeAttributes.Public | TypeAttributes.Sealed,
+                typeof(object), new[] { interfaceType });
+
+            MethodInfo[] methods = interfaceType.GetMethods();
+            for (int i = 0; i < methods.Length; i++)
+            {
+                MethodInfo mi = methods[i];
+                ParameterInfo[] pars = mi.GetParameters();
+                Type[] paramTypes = new Type[pars.Length];
+                for (int p = 0; p < pars.Length; p++)
+                    paramTypes[p] = pars[p].ParameterType;
+
+                MethodBuilder method = tb.DefineMethod(
+                    mi.Name,
+                    MethodAttributes.Public | MethodAttributes.Virtual | MethodAttributes.Final | MethodAttributes.NewSlot,
+                    mi.ReturnType, paramTypes);
+
+                ILGenerator il = method.GetILGenerator();
+                if (mi.Name == "get_Id")
+                {
+                    il.Emit(OpCodes.Ldstr, FpsTagId);
+                    il.Emit(OpCodes.Ret);
+                }
+                else if (mi.Name == "get_DisplayNameKey")
+                {
+                    il.Emit(OpCodes.Ldstr, "");
+                    il.Emit(OpCodes.Ret);
+                }
+                else
+                {
+                    il.Emit(OpCodes.Ldarg_1);
+                    if (paramTypes.Length > 0 && paramTypes[0].IsValueType)
+                        il.Emit(OpCodes.Box, paramTypes[0]);
+                    MethodInfo bridgeMethod = typeof(FpsRuleBridge).GetMethod(
+                        mi.Name,
+                        BindingFlags.Public | BindingFlags.Static,
+                        null, new[] { typeof(object) }, null);
+                    if (bridgeMethod == null)
+                        throw new System.MissingMethodException("FpsRuleBridge." + mi.Name);
+                    il.Emit(OpCodes.Call, bridgeMethod);
+                    il.Emit(OpCodes.Ret);
+                }
+                tb.DefineMethodOverride(method, mi);
+            }
+
+            return tb.CreateType();
+        }
+
+        // ── Settings panel integration (one timer panel; HSRTimer preferred) ─
+
+        private static void TryPatchSettingsPanel()
+        {
+            if (Enabled) return;
+            TryPatchSettingsPanel(HSRTimerAssembly);
+            if (!Enabled)
+                TryPatchSettingsPanel(TwilightTimerAssembly);
+        }
+
+        private static void TryPatchSettingsPanel(string assemblyName)
+        {
+            if (Enabled) return;
+            try
+            {
+                Type panelType = Type.GetType(assemblyName + ".SettingsPanel, " + assemblyName);
+                if (panelType == null) return;
+
+                var refresh = panelType.GetMethod("RefreshTabDisplays", BindingFlags.Instance | BindingFlags.NonPublic);
+                var draw = panelType.GetMethod("Draw", BindingFlags.Instance | BindingFlags.NonPublic);
+                _tabDisplaysField = panelType.GetField("_tabDisplays", BindingFlags.Instance | BindingFlags.NonPublic);
+                _tabField = panelType.GetField("_tab", BindingFlags.Instance | BindingFlags.NonPublic);
+                if (refresh == null || draw == null || _tabDisplaysField == null || _tabField == null)
+                {
+                    Plugin.Logger.LogWarning($"PerspectiveSwitcher: {assemblyName}.SettingsPanel shape mismatch; standalone settings UI stays available.");
+                    return;
+                }
+
+                var keysField = panelType.GetField("_tabKeys", BindingFlags.Static | BindingFlags.NonPublic);
+                var keys = keysField != null ? keysField.GetValue(null) as string[] : null;
+                if (keys != null && keys.Length > 0)
+                    _baseTabCount = keys.Length;
+
+                var harmony = new HarmonyLib.Harmony(PluginInfo.PLUGIN_GUID + "." + assemblyName);
+                harmony.Patch(refresh,
+                    postfix: new HarmonyLib.HarmonyMethod(typeof(TimerIntegration).GetMethod(
+                        "RefreshPostfix", BindingFlags.Static | BindingFlags.NonPublic)));
+                harmony.Patch(draw,
+                    transpiler: new HarmonyLib.HarmonyMethod(typeof(TimerIntegration).GetMethod(
+                        "DrawTranspiler", BindingFlags.Static | BindingFlags.NonPublic)));
+
+                Enabled = true;
+                Plugin.Logger.LogInfo($"PerspectiveSwitcher: settings page integrated into {assemblyName} settings panel (last tab).");
+            }
+            catch (System.Exception ex)
+            {
+                Plugin.Logger.LogWarning($"PerspectiveSwitcher: {assemblyName} settings panel integration failed: {ex.Message}");
             }
         }
 
         private static void RefreshPostfix(object __instance)
         {
-            if (__instance == null) return;
+            if (__instance == null || _tabDisplaysField == null) return;
             var arr = _tabDisplaysField.GetValue(__instance) as string[];
             if (arr == null || arr.Length != _baseTabCount) return;
             Array.Resize(ref arr, _baseTabCount + 1);
@@ -769,7 +990,7 @@ namespace DouBai.PerspectiveSwitcher
             if (switchIdx < 0) return codes;
 
             var skip = new Label();
-            var drawMethod = typeof(HsrTimerIntegration).GetMethod("DrawOurControls", BindingFlags.Static | BindingFlags.NonPublic);
+            var drawMethod = typeof(TimerIntegration).GetMethod("DrawOurControls", BindingFlags.Static | BindingFlags.NonPublic);
             var insert = new List<CodeInstruction>
             {
                 new CodeInstruction(OpCodes.Ldarg_0),
