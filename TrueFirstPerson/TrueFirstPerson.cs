@@ -806,7 +806,12 @@ namespace DouBai.PerspectiveSwitcher
 
         public static void OnLevelExit(object ctx)
         {
-            PerspectiveController.SetFpsRuleActive(false);
+            // HSRTimer fires this both when a run segment is completed (before
+            // the next level loads) and when it ends for good, so releasing the
+            // FPS lock here would briefly drop back to third person during the
+            // LoadingLevel gap between campaign levels. Instead, leave the lock
+            // on and let PerspectiveController release it when the game actually
+            // goes inactive (quit/menu) or when timer ticks stop while playing.
         }
     }
 
