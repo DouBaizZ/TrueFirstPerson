@@ -236,7 +236,12 @@ namespace DouBai.PerspectiveSwitcher
             GameState state = game.state;
             if (state == GameState.PlayingLevel)
                 return Time.unscaledTime - _lastTimerFpsRuleTick <= TimerFpsRuleTimeout;
-            if (state == GameState.Paused)
+            // Keep the camera locked while a level is loading. The timer only
+            // ticks during PlayingLevel, so during the LoadingLevel gap between
+            // campaign levels OnTick goes quiet even though the FPS tag is still
+            // enabled. Treat LoadingLevel (and Paused) as still active; release
+            // only on Inactive (quit/menu/retry) or when ticks stop while playing.
+            if (state == GameState.Paused || state == GameState.LoadingLevel)
                 return true;
             return false;
         }
